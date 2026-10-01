@@ -1930,6 +1930,8 @@ pub fn visit_stmt<V: AstVisitor>(stmt: &ast::Stmt, visitor: &mut V) -> Result<()
         | ast::Stmt::CreateSchema { .. }
         | ast::Stmt::CreateRole { .. }
         | ast::Stmt::SetRole { .. }
+        | ast::Stmt::CreatePolicy(_)
+        | ast::Stmt::DropPolicy { .. }
         | ast::Stmt::DropSchema { .. } => {}
     }
     Ok(())
