@@ -171,6 +171,9 @@ pub fn translate_create_role(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
+    if !resolver.catalog.dialect.supports_roles() {
+        bail_parse_error!("CREATE ROLE is not supported");
+    }
     if resolver.schema().roles.get_by_name(role_name).is_some() {
         bail_parse_error!("role \"{role_name}\" already exists");
     }
@@ -303,6 +306,7 @@ mod tests {
 
     use turso_parser::ast;
 
+    use crate::dialect::SqliteWithRolesDialect;
     use crate::security::permission::{Action, Object, PermissionDenied};
     use crate::security::roles::RoleId;
     use crate::{
@@ -342,6 +346,24 @@ mod tests {
 
         assert!(
             error.to_string().contains("role \"alice\" already exists"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn create_role_fails_under_a_dialect_without_roles() {
+        let db = Database::open_file(
+            Arc::new(MemoryIO::new()),
+            ":memory:",
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect(crate::ConnectOpts::new()).unwrap();
+
+        let error = create_role(&conn, "alice").unwrap_err();
+
+        assert!(
+            error.to_string().contains("CREATE ROLE is not supported"),
             "{error}"
         );
     }
@@ -515,7 +537,7 @@ mod tests {
             OpenFlags::Create,
             DatabaseOpts::new(),
             None,
-            Arc::new(SqliteDialect),
+            Arc::new(SqliteWithRolesDialect),
         )
         .unwrap();
         db.connect(crate::ConnectOpts::new()).unwrap()
