@@ -310,6 +310,31 @@ fn pull_remote_changes_after_a_rename_with_unpushed_local_changes() -> Result<()
 }
 
 #[test]
+fn rename_table_with_a_non_ascii_name_and_unpushed_local_changes() -> Result<()> {
+    let remote = Remote::new(&[
+        "CREATE TABLE \"Äb\" (x PRIMARY KEY, y)",
+        "INSERT INTO \"Äb\" VALUES (1, 2)",
+    ])?;
+    let replica = remote.bootstrap_replica()?;
+    replica.execute("INSERT INTO \"Äb\" VALUES (5, 6)")?;
+
+    remote.execute_transaction(&["ALTER TABLE \"Äb\" RENAME TO u"])?;
+    replica.pull()?;
+    remote.execute_transaction(&["INSERT INTO u VALUES (10, 10)"])?;
+    replica.pull()?;
+
+    assert_eq!(
+        replica.query("SELECT * FROM u ORDER BY x")?,
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(2)],
+            vec![Value::from_i64(5), Value::from_i64(6)],
+            vec![Value::from_i64(10), Value::from_i64(10)],
+        ]
+    );
+    Ok(())
+}
+
+#[test]
 fn rename_table_right_after_a_replace_base_snapshot_with_unpushed_local_changes() -> Result<()> {
     let remote = Remote::new(&[
         "CREATE TABLE t (x PRIMARY KEY, y)",

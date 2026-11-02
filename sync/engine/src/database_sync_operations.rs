@@ -2707,7 +2707,7 @@ pub async fn rename_tables_in_local_changes<Ctx>(
         let current_name = current_name
             .as_deref()
             .expect("a table renamed to a temporary name must be renamed back");
-        let old_name = sql_string_literal(&old_name.to_lowercase());
+        let old_name = sql_string_literal(&old_name.to_ascii_lowercase());
         when_clauses.push_str(&format!(
             " WHEN {old_name} THEN {}",
             sql_string_literal(current_name)
