@@ -160,6 +160,11 @@ pub fn translate(
         roles::check_statement_privileges(&stmt, &resolver, &connection)?;
     }
     let write_privilege = roles::write_privilege(&stmt);
+    let ownership = if prepare_options.reads_engine_metadata {
+        None
+    } else {
+        roles::ownership_of_created_object(&stmt, &resolver, &connection)?
+    };
 
     match stmt {
         // There can be no nesting with pragma, so lift it up here
@@ -173,7 +178,10 @@ pub fn translate(
                 &mut program,
             )?;
         }
-        stmt => translate_inner(stmt, &mut resolver, &mut program, &connection, input)?,
+        stmt => {
+            translate_inner(stmt, &mut resolver, &mut program, &connection, input)?;
+            roles::emit_ownership(&resolver, &mut program, ownership)?;
+        }
     };
 
     program.epilogue(schema);
