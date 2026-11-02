@@ -15182,6 +15182,20 @@ pub fn op_add_role(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_update_row_security(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(UpdateRowSecurity { db, change }, insn);
+    program.connection.with_database_schema_mut(*db, |schema| {
+        Arc::make_mut(&mut schema.row_security).apply(change)
+    })?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_set_role(
     program: &Program,
     state: &mut ProgramState,

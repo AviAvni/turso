@@ -176,6 +176,10 @@ pub struct Resolver<'a> {
     /// shared state, a self-referential `ON DELETE CASCADE` could fail to see
     /// that its own action program is already being built.
     pub(super) fk_action_compile_stack: FkActionCompileStack,
+    /// The role whose rows row-level security shows to the statement being
+    /// compiled. `None` when row policies do not apply, as for the superuser
+    /// and for statements the engine runs on its own behalf.
+    pub(crate) row_security_role: Option<String>,
 }
 
 /// The column a register stands for in [Resolver::register_columns].
@@ -386,6 +390,7 @@ impl<'a> Resolver<'a> {
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: crate::SubqueryUnnestingMode::Auto,
             fk_action_compile_stack: FkActionCompileStack::default(),
+            row_security_role: None,
         }
     }
 
@@ -420,6 +425,7 @@ impl<'a> Resolver<'a> {
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
+            row_security_role: self.row_security_role.clone(),
         }
     }
 
@@ -436,6 +442,7 @@ impl<'a> Resolver<'a> {
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             fk_action_compile_stack: self.fk_action_compile_stack.clone(),
+            row_security_role: self.row_security_role.clone(),
         }
     }
 

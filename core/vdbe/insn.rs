@@ -1913,6 +1913,11 @@ pub enum Insn {
     SetRole {
         role_name: Option<String>,
     },
+    /// Apply a change to the in-memory row-level security catalog
+    UpdateRowSecurity {
+        db: usize,
+        change: Box<crate::security::row_security::RowSecurityChange>,
+    },
     /// Add a role to the in-memory role catalog after its row was inserted
     AddRole {
         db: usize,
@@ -2577,6 +2582,7 @@ impl InsnVariants {
             InsnVariants::SequenceCommitInnerTx => execute::op_sequence_commit_inner_tx,
             InsnVariants::AddType => execute::op_add_type,
             InsnVariants::AddRole => execute::op_add_role,
+            InsnVariants::UpdateRowSecurity => execute::op_update_row_security,
             InsnVariants::SetRole => execute::op_set_role,
             InsnVariants::DropView => execute::op_drop_view,
             InsnVariants::Close => execute::op_close,
@@ -2725,6 +2731,7 @@ impl Insn {
             | Self::SequenceCommitInnerTx { .. }
             | Self::AddType { .. }
             | Self::AddRole { .. }
+            | Self::UpdateRowSecurity { .. }
             | Self::ParseSchema { .. }
             | Self::PopulateMaterializedViews { .. }
             | Self::SetCookie { .. }
