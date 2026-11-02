@@ -108,6 +108,7 @@ pub enum Object {
     Role(String),
     /// A connection or database setting, such as a pragma.
     Setting(String),
+    File(String),
 }
 
 impl fmt::Display for Object {
@@ -123,6 +124,7 @@ impl fmt::Display for Object {
             Object::Type(name) => write!(f, "type {name}"),
             Object::Role(name) => write!(f, "role {name}"),
             Object::Setting(name) => write!(f, "setting {name}"),
+            Object::File(name) => write!(f, "file {name}"),
         }
     }
 }
