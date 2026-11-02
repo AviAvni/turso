@@ -342,7 +342,7 @@ pub fn translate_create_role(
         rowid_reg: id_reg,
         prev_largest_reg: 0,
     });
-    let first_column_reg = program.alloc_registers(4);
+    let first_column_reg = program.alloc_registers(5);
     program.emit_insn(Insn::Null {
         dest: first_column_reg,
         dest_end: None,
@@ -359,10 +359,15 @@ pub fn translate_create_role(
         value: ignores_row_policies as i64,
         dest: first_column_reg + 3,
     });
+    let dropped = false;
+    program.emit_insn(Insn::Integer {
+        value: dropped as i64,
+        dest: first_column_reg + 4,
+    });
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
         start_reg: to_u32(first_column_reg),
-        count: to_u32(4),
+        count: to_u32(5),
         dest_reg: to_u32(record_reg),
         index_name: None,
         affinity_str: None,
@@ -474,6 +479,27 @@ mod tests {
         let alice = roles.get_by_name("alice").unwrap();
         assert!(!alice.superuser);
         assert!(!alice.ignores_row_policies);
+    }
+
+    #[test]
+    fn create_role_stores_a_role_that_is_not_dropped() {
+        let conn = open_connection();
+
+        create_role(&conn, "alice").unwrap();
+
+        let mut stmt = conn
+            .prepare("SELECT id, name, superuser, ignores_row_policies, dropped FROM __turso_internal_roles")
+            .unwrap();
+        assert_eq!(
+            stmt.run_collect_rows().unwrap(),
+            vec![vec![
+                Value::from_i64(1),
+                Value::build_text("alice"),
+                Value::from_i64(0),
+                Value::from_i64(0),
+                Value::from_i64(0),
+            ]]
+        );
     }
 
     #[test]

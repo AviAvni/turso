@@ -4,7 +4,9 @@
 //! database has two built-in roles: a superuser, and `public`, which every
 //! role is a member of. The dialect names them. Roles created with
 //! `CREATE ROLE` are stored in the `__turso_internal_roles` table, which is
-//! created together with the first such role.
+//! created together with the first such role. A dropped role's row stays in
+//! the table, marked dropped, so that its id is never given to another role:
+//! a connection may still run as the dropped role, and the id is the rowid.
 //!
 //! Each schema holds a [`RoleCatalog`], an in-memory copy of all roles. It is
 //! loaded together with the schema, and a statement that changes roles bumps
@@ -25,10 +27,11 @@ pub const CREATE_ROLES_TABLE_SQL: &str = "CREATE TABLE __turso_internal_roles (\
     id INTEGER PRIMARY KEY, \
     name TEXT NOT NULL, \
     superuser INTEGER NOT NULL, \
-    ignores_row_policies INTEGER NOT NULL)";
+    ignores_row_policies INTEGER NOT NULL, \
+    dropped INTEGER NOT NULL)";
 
 pub const SELECT_ROLES_SQL: &str =
-    "SELECT id, name, superuser, ignores_row_policies FROM __turso_internal_roles";
+    "SELECT id, name, superuser, ignores_row_policies, dropped FROM __turso_internal_roles";
 
 /// The names of the built-in roles. Each dialect chooses them, so that they
 /// match the names its users expect.
@@ -112,7 +115,8 @@ impl RoleCatalog {
 
     /// Returns a catalog with the built-in roles of this catalog and the
     /// roles read from the roles table. Each row is
-    /// `(id, name, superuser, ignores_row_policies)`.
+    /// `(id, name, superuser, ignores_row_policies, dropped)`. A dropped
+    /// role is not in the catalog, and its name may belong to another role.
     pub fn with_stored_roles(&self, rows: &[Vec<Value>]) -> Result<Self> {
         let mut catalog = Self {
             roles: BTreeMap::new(),
@@ -122,7 +126,9 @@ impl RoleCatalog {
             catalog.add(role.clone());
         }
         for row in rows {
-            let role = role_from_row(row)?;
+            let Some(role) = role_from_row(row)? else {
+                continue;
+            };
             if catalog.roles.contains_key(&role.id) || catalog.ids_by_name.contains_key(&role.name)
             {
                 return Err(LimboError::Corrupt(format!(
@@ -174,22 +180,24 @@ impl RoleCatalog {
     }
 }
 
-fn role_from_row(row: &[Value]) -> Result<Role> {
-    let [id, name, superuser, ignores_row_policies] = row else {
+/// Returns the role stored in `row`, or `None` for a dropped role.
+fn role_from_row(row: &[Value]) -> Result<Option<Role>> {
+    let [id, name, superuser, ignores_row_policies, dropped] = row else {
         return Err(corrupt_row(row));
     };
-    match (id, name, superuser, ignores_row_policies) {
+    match (id, name, superuser, ignores_row_policies, dropped) {
         (
             Value::Numeric(Numeric::Integer(id)),
             Value::Text(name),
             Value::Numeric(Numeric::Integer(superuser @ (0 | 1))),
             Value::Numeric(Numeric::Integer(ignores_row_policies @ (0 | 1))),
-        ) if *id > 0 => Ok(Role {
+            Value::Numeric(Numeric::Integer(dropped @ (0 | 1))),
+        ) if *id > 0 => Ok((*dropped == 0).then(|| Role {
             id: RoleId::from_rowid(*id),
             name: name.as_str().to_string(),
             superuser: *superuser == 1,
             ignores_row_policies: *ignores_row_policies == 1,
-        }),
+        })),
         _ => Err(corrupt_row(row)),
     }
 }
@@ -252,6 +260,25 @@ mod tests {
     }
 
     #[test]
+    fn with_stored_roles_skips_dropped_roles_and_frees_their_names() {
+        let catalog = RoleCatalog::new(NAMES)
+            .with_stored_roles(&[
+                role_row(1, "alice", 0),
+                dropped_role_row(2, "bob"),
+                role_row(3, "bob", 0),
+            ])
+            .unwrap();
+
+        let names: Vec<_> = catalog.iter().map(|role| role.name.as_str()).collect();
+        assert_eq!(names, vec!["everyone", "admin", "alice", "bob"]);
+        assert_eq!(
+            catalog.get_by_name("bob").unwrap().id,
+            RoleId::from_rowid(3)
+        );
+        assert!(catalog.get(RoleId::from_rowid(2)).is_none());
+    }
+
+    #[test]
     fn with_stored_roles_rejects_a_duplicate_role_name() {
         let error = RoleCatalog::new(NAMES)
             .with_stored_roles(&[role_row(1, "alice", 0), role_row(2, "alice", 0)])
@@ -299,6 +326,17 @@ mod tests {
             Value::build_text(name.to_string()),
             Value::from_i64(0),
             Value::from_i64(ignores_row_policies),
+            Value::from_i64(0),
+        ]
+    }
+
+    fn dropped_role_row(id: i64, name: &str) -> Vec<Value> {
+        vec![
+            Value::from_i64(id),
+            Value::build_text(name.to_string()),
+            Value::from_i64(0),
+            Value::from_i64(0),
+            Value::from_i64(1),
         ]
     }
 }
