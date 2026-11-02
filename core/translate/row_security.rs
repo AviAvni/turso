@@ -7,8 +7,8 @@ use crate::{
     namespace::{mangle_name, NamespaceId, NamespaceRef},
     schema::{BTreeTable, Table},
     security::row_security::{
-        RowSecurityCatalog, RowSecurityChange, CREATE_ROW_SECURITY_TABLE_SQL,
-        ROW_SECURITY_TABLE_NAME,
+        Policy, PolicyCondition, RowSecurityCatalog, RowSecurityChange,
+        CREATE_ROW_SECURITY_TABLE_SQL, ROW_SECURITY_TABLE_NAME,
     },
     storage::pager::CreateBTreeFlags,
     translate::{
@@ -57,7 +57,99 @@ pub fn translate_row_security_change(
     Ok(())
 }
 
-/// DROP TABLE removes the table's row-level security.
+/// CREATE POLICY for the forms supported so far: a permissive SELECT (or
+/// ALL) policy for every role, whose USING condition shows every row, no
+/// row, or the rows whose owner column equals the current role.
+pub fn translate_create_policy(
+    policy: &ast::CreatePolicy,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    let (namespace, table) = main_btree_table(&policy.tbl_name, resolver)?;
+    let stored_name = stored_table_name(namespace, &table.declared_name);
+    let name = normalize_ident(policy.policy_name.as_str());
+    if catalog(resolver)
+        .policies(&stored_name)
+        .iter()
+        .any(|existing| existing.name == name)
+    {
+        bail_parse_error!(
+            "policy \"{name}\" for table \"{}\" already exists",
+            table.declared_name
+        );
+    }
+    if policy.restrictive {
+        bail_parse_error!("RESTRICTIVE policies are not supported");
+    }
+    if !matches!(
+        policy.command,
+        ast::PolicyCommand::All | ast::PolicyCommand::Select
+    ) {
+        bail_parse_error!("only FOR SELECT and FOR ALL policies are supported");
+    }
+    if !policy.roles.is_empty() {
+        bail_parse_error!("only policies TO PUBLIC are supported");
+    }
+    if policy.check_expr.is_some() {
+        bail_parse_error!("WITH CHECK is not supported");
+    }
+    let Some(using_expr) = &policy.using_expr else {
+        bail_parse_error!("a policy needs a USING condition");
+    };
+    let condition = policy_condition(using_expr, &table)?;
+
+    let (condition_value, column_name) = condition.to_row_values();
+    let rows = RowSecurityRows::open(resolver, program)?;
+    rows.emit_insert(
+        program,
+        &["policy", &name, &stored_name, condition_value, column_name],
+    );
+    emit_catalog_update(
+        program,
+        resolver,
+        RowSecurityChange::CreatePolicy {
+            table: stored_name,
+            policy: Policy { name, condition },
+        },
+    );
+    Ok(())
+}
+
+pub fn translate_drop_policy(
+    policy_name: &ast::Name,
+    tbl_name: &ast::QualifiedName,
+    if_exists: bool,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    let (namespace, table) = main_btree_table(tbl_name, resolver)?;
+    let stored_name = stored_table_name(namespace, &table.declared_name);
+    let name = normalize_ident(policy_name.as_str());
+    let exists = catalog(resolver)
+        .policies(&stored_name)
+        .iter()
+        .any(|policy| policy.name == name);
+    if !exists {
+        if if_exists {
+            return Ok(());
+        }
+        bail_parse_error!(
+            "policy \"{name}\" for table \"{}\" does not exist",
+            table.declared_name
+        );
+    }
+    let table = stored_name;
+    let rows = RowSecurityRows::open(resolver, program)?;
+    rows.emit_delete(program, &[("policy", 0), (&name, 1), (&table, 2)]);
+    emit_catalog_update(
+        program,
+        resolver,
+        RowSecurityChange::DropPolicy { table, name },
+    );
+    Ok(())
+}
+
+/// DROP TABLE removes the table's row-level security and policies.
 pub fn emit_drop_table_row_security_cleanup(
     table_name: &str,
     namespace: NamespaceRef,
@@ -70,6 +162,7 @@ pub fn emit_drop_table_row_security_cleanup(
     }
     let rows = RowSecurityRows::open(resolver, program)?;
     rows.emit_delete(program, &[("row_security", 0), (&table, 2)]);
+    rows.emit_delete(program, &[("policy", 0), (&table, 2)]);
     emit_catalog_update(program, resolver, RowSecurityChange::DropTable(table));
     Ok(())
 }
@@ -83,16 +176,42 @@ pub fn reject_rename_of_table_with_row_security(
         && has_row_security(&stored_table_name(namespace, table_name), resolver)
     {
         bail_parse_error!(
-            "cannot rename table \"{table_name}\": renaming tables with row-level security is not supported"
+            "cannot rename table \"{table_name}\": renaming tables with row-level security or policies is not supported"
         );
     }
     Ok(())
 }
 
-/// A role sees no rows of a table with row-level security: every such table
-/// in the FROM clause gets a filter that is always false. For the right side
-/// of an outer join the filter is part of the join condition, so the hidden
-/// rows produce NULLs like rows that do not exist. The filters go before the
+/// Policies refer to their owner column by name, so it cannot be renamed,
+/// dropped or redefined.
+pub fn reject_change_of_policy_column(
+    table_name: &str,
+    namespace: NamespaceRef,
+    column_name: &str,
+    resolver: &Resolver,
+) -> Result<()> {
+    if namespace.database_id != MAIN_DB_ID {
+        return Ok(());
+    }
+    let column_name = normalize_ident(column_name);
+    let stored_name = stored_table_name(namespace, table_name);
+    let used_by_policy = catalog(resolver).policies(&stored_name).iter().any(|policy| {
+        matches!(&policy.condition, PolicyCondition::OwnedByRole(column) if *column == column_name)
+    });
+    if used_by_policy {
+        bail_parse_error!(
+            "cannot change column \"{column_name}\" of table \"{table_name}\": a row-level security policy uses it"
+        );
+    }
+    Ok(())
+}
+
+/// A role sees only the rows of a table with row-level security that one of
+/// the table's policies shows: every such table in the FROM clause gets a
+/// filter that combines the policies with OR, and that is always false
+/// without policies. For the right side of an outer join the filter is part
+/// of the join condition, so the hidden rows produce NULLs like rows that do
+/// not exist. The filters go before the
 /// query's own conditions, so no expression of the query sees a hidden row.
 /// The tables are recorded so the optimizer does not choose access methods
 /// that evaluate the query's expressions on a row before its filter.
@@ -103,6 +222,7 @@ pub fn add_select_row_security_filters(
 ) -> Result<()> {
     let mut filters = Vec::new();
     let mut filtered_tables = Vec::new();
+    let mut used_columns = Vec::new();
     for table in table_references.joined_tables() {
         let Table::BTree(btree) = &table.table else {
             continue;
@@ -120,13 +240,43 @@ pub fn add_select_row_security_filters(
                 btree.declared_name
             );
         }
+        let role = resolver
+            .row_security_role
+            .as_deref()
+            .expect("row security applies to roles");
+        let catalog = catalog(resolver);
+        let policies = catalog.policies(&stored_table_name(table.namespace, &btree.declared_name));
+        if policies
+            .iter()
+            .any(|policy| policy.condition == PolicyCondition::AllRows)
+        {
+            continue;
+        }
+        let mut visible = None;
+        for policy in policies {
+            let PolicyCondition::OwnedByRole(column) = &policy.condition else {
+                continue;
+            };
+            let (index, column) = btree
+                .get_column(column)
+                .expect("policy columns cannot be dropped");
+            used_columns.push((table.internal_id, index));
+            let owned = owned_by_role(table.internal_id, index, column.is_rowid_alias(), role);
+            visible = Some(match visible {
+                None => owned,
+                Some(previous) => {
+                    ast::Expr::Binary(Box::new(previous), ast::Operator::Or, Box::new(owned))
+                }
+            });
+        }
         filtered_tables.push(table.internal_id);
         let is_outer = table
             .join_info
             .as_ref()
             .is_some_and(|join_info| join_info.is_outer());
         filters.push(WhereTerm {
-            expr: ast::Expr::Literal(ast::Literal::Numeric("0".to_string())),
+            expr: visible
+                .unwrap_or_else(|| ast::Expr::Literal(ast::Literal::Numeric("0".to_string()))),
             origin: if is_outer {
                 WhereTermOrigin::Join(JoinOrigin::Outer(table.internal_id))
             } else {
@@ -138,8 +288,37 @@ pub fn add_select_row_security_filters(
     for internal_id in filtered_tables {
         table_references.mark_row_security_filtered(internal_id);
     }
+    for (internal_id, column) in used_columns {
+        table_references.mark_column_used(internal_id, column);
+    }
     where_clause.splice(0..0, filters);
     Ok(())
+}
+
+/// `column = '<role>' COLLATE BINARY`: the column's own collation must not
+/// make a different role's name match.
+fn owned_by_role(
+    table: ast::TableInternalId,
+    column: usize,
+    is_rowid_alias: bool,
+    role: &str,
+) -> ast::Expr {
+    ast::Expr::Binary(
+        Box::new(ast::Expr::Column {
+            database: None,
+            table,
+            column,
+            is_rowid_alias,
+        }),
+        ast::Operator::Equals,
+        Box::new(ast::Expr::Collate(
+            Box::new(ast::Expr::Literal(ast::Literal::String(format!(
+                "'{}'",
+                role.replace('\'', "''")
+            )))),
+            ast::Name::exact("BINARY".to_string()),
+        )),
+    )
 }
 
 /// A role cannot write to a table with row-level security yet.
@@ -211,8 +390,142 @@ fn stored_table_name(namespace: NamespaceRef, table_name: &str) -> String {
     mangle_name(namespace.id, &normalize_ident(table_name))
 }
 
+/// The condition of a supported USING expression: `true`, `false`, or
+/// `<column> = current_user` in either order, where `current_user` may also
+/// be written as `current_user()` or `(SELECT current_user)`.
+fn policy_condition(expr: &ast::Expr, table: &BTreeTable) -> Result<PolicyCondition> {
+    let expr = unwrap_parens(expr);
+    match expr {
+        ast::Expr::Literal(ast::Literal::True) => return Ok(PolicyCondition::AllRows),
+        ast::Expr::Literal(ast::Literal::False) => return Ok(PolicyCondition::NoRows),
+        ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "1" => {
+            return Ok(PolicyCondition::AllRows)
+        }
+        ast::Expr::Literal(ast::Literal::Numeric(n)) if n == "0" => {
+            return Ok(PolicyCondition::NoRows)
+        }
+        ast::Expr::Binary(lhs, ast::Operator::Equals, rhs) => {
+            let (lhs, rhs) = (unwrap_parens(lhs), unwrap_parens(rhs));
+            for (column, role) in [(lhs, rhs), (rhs, lhs)] {
+                if is_current_user(role, table) {
+                    if let Some(column) = column_of(column, table)? {
+                        return Ok(PolicyCondition::OwnedByRole(column));
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+    bail_parse_error!(
+        "unsupported policy condition {expr}: only true, false and <column> = current_user are supported"
+    )
+}
+
+fn unwrap_parens(expr: &ast::Expr) -> &ast::Expr {
+    match expr {
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => unwrap_parens(&exprs[0]),
+        _ => expr,
+    }
+}
+
+fn is_current_user(expr: &ast::Expr, table: &BTreeTable) -> bool {
+    match expr {
+        ast::Expr::FunctionCall {
+            name,
+            distinctness: None,
+            args,
+            order_by,
+            within_group,
+            filter_over,
+        } => {
+            name.as_str().eq_ignore_ascii_case("current_user")
+                && args.is_empty()
+                && order_by.is_empty()
+                && within_group.is_empty()
+                && filter_over.filter_clause.is_none()
+                && filter_over.over_clause.is_none()
+        }
+        ast::Expr::Id(name) => {
+            name.as_str().eq_ignore_ascii_case("current_user")
+                && table.get_column(name.as_str()).is_none()
+        }
+        ast::Expr::Subquery(select) => single_value_of(select)
+            .is_some_and(|value| is_current_user(unwrap_parens(value), table)),
+        _ => false,
+    }
+}
+
+/// The expression of `SELECT <expr>` without FROM or any other clause.
+fn single_value_of(select: &ast::Select) -> Option<&ast::Expr> {
+    if select.with.is_some()
+        || !select.body.compounds.is_empty()
+        || !select.order_by.is_empty()
+        || select.limit.is_some()
+    {
+        return None;
+    }
+    match &select.body.select {
+        ast::OneSelect::Select {
+            distinctness: None,
+            columns,
+            from: None,
+            where_clause: None,
+            group_by: None,
+            window_clause,
+        } if window_clause.is_empty() => match columns.as_slice() {
+            [ast::ResultColumn::Expr(expr, _)] => Some(expr),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The name of the column `expr` refers to, written as `column` or
+/// `table.column`. Virtual generated columns are rejected.
+fn column_of(expr: &ast::Expr, table: &BTreeTable) -> Result<Option<String>> {
+    let name = match expr {
+        ast::Expr::Id(name) => name,
+        ast::Expr::Qualified(qualifier, name)
+            if normalize_ident(qualifier.as_str()) == normalize_ident(&table.declared_name) =>
+        {
+            name
+        }
+        _ => return Ok(None),
+    };
+    let Some((_, column)) = table.get_column(name.as_str()) else {
+        bail_parse_error!("no such column: {}", name.as_str());
+    };
+    if column.is_virtual_generated() {
+        bail_parse_error!(
+            "generated column \"{}\" cannot be a policy owner column",
+            name.as_str()
+        );
+    }
+    Ok(Some(normalize_ident(name.as_str())))
+}
+
+/// Whether the table has row-level security or policies.
 fn has_row_security(table_name: &str, resolver: &Resolver) -> bool {
-    catalog(resolver).has_row_security(table_name)
+    let catalog = catalog(resolver);
+    catalog.has_row_security(table_name) || !catalog.policies(table_name).is_empty()
+}
+
+fn main_btree_table(
+    name: &ast::QualifiedName,
+    resolver: &Resolver,
+) -> Result<(NamespaceRef, Arc<BTreeTable>)> {
+    if !resolver.catalog.dialect.supports_roles() {
+        bail_parse_error!("row-level security is not supported");
+    }
+    let namespace = resolver.resolve_existing_table(name)?;
+    reject_table_outside_main(namespace)?;
+    match resolver
+        .schema()
+        .get_btree_table(namespace.id, name.name.as_str())
+    {
+        Some(table) => Ok((namespace, table)),
+        None => bail_parse_error!("no such table: {}", name.name.as_str()),
+    }
 }
 
 fn catalog(resolver: &Resolver) -> Arc<RowSecurityCatalog> {
@@ -384,7 +697,7 @@ mod tests {
 
     use turso_parser::ast;
 
-    use crate::dialect::SqliteWithRolesDialect;
+    use crate::dialect::{Dialect, SqliteWithRolesDialect};
     use crate::{Connection, Database, DatabaseOpts, MemoryIO, OpenFlags, Value, IO};
 
     fn open_database(opts: DatabaseOpts) -> Arc<Database> {
@@ -792,6 +1105,329 @@ mod tests {
         }
     }
 
+    fn create_docs_with_owner_policy(conn: &Arc<Connection>) {
+        create_docs_with_row_security(conn);
+        create_role(conn, "bob").unwrap();
+        create_policy(conn, policy("own", "docs", "owner = current_user")).unwrap();
+    }
+
+    #[test]
+    fn owner_policy_shows_rows_owned_by_role() {
+        let conn = open_connection();
+        create_docs_with_owner_policy(&conn);
+
+        set_role(&conn, "alice").unwrap();
+
+        for sql in [
+            "SELECT id FROM docs ORDER BY id",
+            "SELECT d.id FROM docs AS d ORDER BY d.id",
+            "SELECT id FROM docs WHERE id IN (1, 2, 3) ORDER BY id",
+            "SELECT docs.id FROM ids JOIN docs ON docs.id >= ids.id WHERE ids.id = 1 ORDER BY docs.id",
+            "WITH d AS (SELECT * FROM docs) SELECT id FROM d ORDER BY id",
+        ] {
+            assert_eq!(integers(&conn, sql), [1, 3], "{sql}");
+        }
+        assert_eq!(
+            integers(&conn, "SELECT count(*) FROM docs WHERE id = 2"),
+            [0]
+        );
+        set_role(&conn, "bob").unwrap();
+        assert_eq!(integers(&conn, "SELECT id FROM docs"), [2]);
+    }
+
+    #[test]
+    fn owner_policy_accepts_supabase_spellings() {
+        for using in [
+            "current_user = owner",
+            "docs.owner = current_user()",
+            "(SELECT current_user) = owner",
+            "((owner) = (SELECT current_user()))",
+        ] {
+            let conn = open_connection();
+            create_docs_with_row_security(&conn);
+            create_policy(&conn, policy("own", "docs", using)).unwrap();
+
+            set_role(&conn, "alice").unwrap();
+
+            assert_eq!(
+                integers(&conn, "SELECT id FROM docs ORDER BY id"),
+                [1, 3],
+                "{using}"
+            );
+        }
+    }
+
+    #[test]
+    fn policies_combine_with_or() {
+        let conn = open_connection();
+        create_docs_with_owner_policy(&conn);
+        conn.execute("ALTER TABLE docs ADD COLUMN editor TEXT")
+            .unwrap();
+        conn.execute("UPDATE docs SET editor = 'alice' WHERE id = 2")
+            .unwrap();
+        let mut edit = policy("edit", "docs", "editor = current_user");
+        edit.command = ast::PolicyCommand::Select;
+        create_policy(&conn, edit).unwrap();
+        create_policy(&conn, policy("none", "docs", "false")).unwrap();
+
+        set_role(&conn, "alice").unwrap();
+        assert_eq!(
+            integers(&conn, "SELECT id FROM docs ORDER BY id"),
+            [1, 2, 3]
+        );
+
+        reset_role(&conn).unwrap();
+        create_policy(&conn, policy("everything", "docs", "true")).unwrap();
+        set_role(&conn, "bob").unwrap();
+        assert_eq!(
+            integers(&conn, "SELECT id FROM docs ORDER BY id"),
+            [1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn owner_policy_compares_role_names_exactly() {
+        let conn = open_connection();
+        conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, owner TEXT COLLATE NOCASE)")
+            .unwrap();
+        conn.execute("INSERT INTO docs VALUES (1, 'alice'), (2, 'ALICE')")
+            .unwrap();
+        create_role(&conn, "alice").unwrap();
+        set_row_security(&conn, "docs", true).unwrap();
+        create_policy(&conn, policy("own", "docs", "owner = current_user")).unwrap();
+
+        set_role(&conn, "alice").unwrap();
+
+        assert_eq!(integers(&conn, "SELECT id FROM docs"), [1]);
+    }
+
+    #[test]
+    fn owner_policy_uses_index_on_owner_column() {
+        let conn = open_connection();
+        create_docs_with_owner_policy(&conn);
+        conn.execute("CREATE INDEX docs_owner ON docs(owner)")
+            .unwrap();
+
+        set_role(&conn, "alice").unwrap();
+
+        let plan = conn
+            .prepare("EXPLAIN QUERY PLAN SELECT id FROM docs")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|row| row[3].to_string().contains("docs_owner")),
+            "{plan:?}"
+        );
+        assert_eq!(integers(&conn, "SELECT id FROM docs ORDER BY id"), [1, 3]);
+    }
+
+    #[test]
+    fn unsupported_policies_are_rejected() {
+        let conn = open_connection();
+        create_docs_with_row_security(&conn);
+        let restrictive = ast::CreatePolicy {
+            restrictive: true,
+            ..policy("p", "docs", "true")
+        };
+        let for_insert = ast::CreatePolicy {
+            command: ast::PolicyCommand::Insert,
+            using_expr: None,
+            check_expr: Some(Box::new(expr("true"))),
+            ..policy("p", "docs", "true")
+        };
+        let to_role = ast::CreatePolicy {
+            roles: vec![ast::Name::exact("alice".to_string())],
+            ..policy("p", "docs", "true")
+        };
+        let with_check = ast::CreatePolicy {
+            check_expr: Some(Box::new(expr("true"))),
+            ..policy("p", "docs", "true")
+        };
+        let without_using = ast::CreatePolicy {
+            using_expr: None,
+            ..policy("p", "docs", "true")
+        };
+        for (policy, expected) in [
+            (restrictive, "RESTRICTIVE"),
+            (for_insert, "FOR SELECT"),
+            (to_role, "TO PUBLIC"),
+            (with_check, "WITH CHECK"),
+            (without_using, "USING"),
+            (
+                policy("p", "docs", "owner = 'alice'"),
+                "unsupported policy condition",
+            ),
+            (
+                policy("p", "docs", "owner = current_user AND id > 1"),
+                "unsupported policy condition",
+            ),
+            (
+                policy("p", "docs", "owner IN (SELECT current_user)"),
+                "unsupported policy condition",
+            ),
+            (
+                policy("p", "docs", "missing = current_user"),
+                "no such column",
+            ),
+            (policy("p", "nope", "true"), "no such table"),
+        ] {
+            assert_error_contains(create_policy(&conn, policy), expected);
+        }
+        create_policy(&conn, policy("p", "docs", "true")).unwrap();
+        assert_error_contains(
+            create_policy(&conn, policy("p", "docs", "true")),
+            "already exists",
+        );
+    }
+
+    #[test]
+    fn policy_owner_column_cannot_be_generated() {
+        let conn = open_connection();
+        conn.execute("CREATE TABLE g(a TEXT, b TEXT AS (a || ''))")
+            .unwrap();
+
+        assert_error_contains(
+            create_policy(&conn, policy("p", "g", "b = current_user")),
+            "generated column",
+        );
+    }
+
+    #[test]
+    fn policies_have_no_effect_without_row_security() {
+        let conn = open_connection();
+        create_docs_with_owner_policy(&conn);
+        set_row_security(&conn, "docs", false).unwrap();
+
+        set_role(&conn, "alice").unwrap();
+
+        assert_eq!(
+            integers(&conn, "SELECT id FROM docs ORDER BY id"),
+            [1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn drop_policy_hides_the_rows_it_showed() {
+        let conn = open_connection();
+        create_docs_with_owner_policy(&conn);
+
+        drop_policy(&conn, "own", "docs", false).unwrap();
+
+        assert_error_contains(drop_policy(&conn, "own", "docs", false), "does not exist");
+        drop_policy(&conn, "own", "docs", true).unwrap();
+        set_role(&conn, "alice").unwrap();
+        assert_eq!(integers(&conn, "SELECT count(*) FROM docs"), [0]);
+    }
+
+    #[test]
+    fn policies_are_seen_by_other_connections() {
+        let db = open_database(DatabaseOpts::new());
+        let conn = connect(&db);
+        let other = connect(&db);
+        integers(&other, "SELECT count(*) FROM sqlite_schema");
+
+        create_docs_with_owner_policy(&conn);
+        set_role(&other, "alice").unwrap();
+
+        assert_eq!(integers(&other, "SELECT id FROM docs ORDER BY id"), [1, 3]);
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
+    fn policies_survive_reopen() {
+        for mvcc in [false, true] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let path = dir.path().join("policies.db");
+            let path = path.to_str().unwrap();
+            let io: Arc<dyn IO> = Arc::new(crate::PlatformIO::new().unwrap());
+            {
+                let db = open_file(&io, path, DatabaseOpts::new());
+                let conn = connect(&db);
+                if mvcc {
+                    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+                }
+                create_docs_with_owner_policy(&conn);
+                conn.close().unwrap();
+            }
+
+            let db = open_file(&io, path, DatabaseOpts::new());
+            let conn = connect(&db);
+            set_role(&conn, "alice").unwrap();
+
+            assert_eq!(
+                integers(&conn, "SELECT id FROM docs ORDER BY id"),
+                [1, 3],
+                "mvcc={mvcc}"
+            );
+        }
+    }
+
+    #[test]
+    fn policy_owner_column_cannot_change() {
+        let conn = open_connection();
+        create_docs_with_owner_policy(&conn);
+
+        for sql in [
+            "ALTER TABLE docs RENAME COLUMN owner TO author",
+            "ALTER TABLE docs DROP COLUMN owner",
+            "ALTER TABLE docs RENAME TO papers",
+        ] {
+            assert_error_contains(conn.execute(sql), "row-level security");
+        }
+        conn.execute("ALTER TABLE docs ADD COLUMN title TEXT")
+            .unwrap();
+        conn.execute("ALTER TABLE docs RENAME COLUMN title TO name")
+            .unwrap();
+        conn.execute("CREATE TEMP TABLE docs(id INTEGER, owner TEXT)")
+            .unwrap();
+        conn.execute("ALTER TABLE temp.docs RENAME COLUMN owner TO author")
+            .unwrap();
+    }
+
+    #[test]
+    fn drop_table_removes_policies() {
+        let conn = open_connection();
+        create_docs_with_owner_policy(&conn);
+
+        conn.execute("DROP TABLE docs").unwrap();
+
+        assert!(texts(
+            &conn,
+            "SELECT kind FROM __turso_internal_row_security WHERE tbl_name = 'docs'"
+        )
+        .is_empty());
+        conn.execute("CREATE TABLE docs(id INTEGER, owner TEXT)")
+            .unwrap();
+        create_policy(&conn, policy("own", "docs", "true")).unwrap();
+    }
+
+    #[test]
+    fn owner_policy_runs_before_multi_index_branch_conditions() {
+        let conn = open_connection();
+        create_docs_with_owner_policy(&conn);
+        for sql in [
+            "ALTER TABLE docs ADD COLUMN body TEXT",
+            "ALTER TABLE docs ADD COLUMN x INTEGER",
+            "UPDATE docs SET body = '{\"x\": 1}', x = id",
+            "UPDATE docs SET body = 'not json' WHERE id = 2",
+            "CREATE INDEX docs_x ON docs(x)",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+
+        set_role(&conn, "alice").unwrap();
+
+        assert_eq!(
+            integers(
+                &conn,
+                "SELECT id FROM docs WHERE id = 1 OR (x = 2 AND json_extract(body, '$.x') = 1)"
+            ),
+            [1]
+        );
+    }
+
     #[cfg(feature = "fs")]
     fn open_file(io: &Arc<dyn IO>, path: &str, opts: DatabaseOpts) -> Arc<Database> {
         Database::open_file_with_flags(
@@ -869,6 +1505,56 @@ mod tests {
                 name: ast::QualifiedName::single(ast::Name::exact(table.to_string())),
                 body: ast::AlterTableBody::RowSecurity(enable),
             }),
+        )
+    }
+
+    /// A permissive policy for every role and every command.
+    fn policy(name: &str, table: &str, using: &str) -> ast::CreatePolicy {
+        ast::CreatePolicy {
+            policy_name: ast::Name::exact(name.to_string()),
+            tbl_name: ast::QualifiedName::single(ast::Name::exact(table.to_string())),
+            restrictive: false,
+            command: ast::PolicyCommand::All,
+            roles: Vec::new(),
+            using_expr: Some(Box::new(expr(using))),
+            check_expr: None,
+        }
+    }
+
+    /// The expression `sql`, parsed as the result column of a SELECT.
+    fn expr(sql: &str) -> ast::Expr {
+        let (Some(ast::Cmd::Stmt(ast::Stmt::Select(select))), _) = crate::dialect::SqliteDialect
+            .parse(&format!("SELECT {sql}"))
+            .unwrap()
+        else {
+            panic!("not a SELECT: {sql}");
+        };
+        let ast::OneSelect::Select { mut columns, .. } = select.body.select else {
+            panic!("not a SELECT: {sql}");
+        };
+        let ast::ResultColumn::Expr(expr, _) = columns.remove(0) else {
+            panic!("not an expression: {sql}");
+        };
+        *expr
+    }
+
+    fn create_policy(conn: &Arc<Connection>, policy: ast::CreatePolicy) -> crate::Result<()> {
+        run(conn, ast::Stmt::CreatePolicy(Box::new(policy)))
+    }
+
+    fn drop_policy(
+        conn: &Arc<Connection>,
+        name: &str,
+        table: &str,
+        if_exists: bool,
+    ) -> crate::Result<()> {
+        run(
+            conn,
+            ast::Stmt::DropPolicy {
+                if_exists,
+                policy_name: ast::Name::exact(name.to_string()),
+                tbl_name: ast::QualifiedName::single(ast::Name::exact(table.to_string())),
+            },
         )
     }
 
