@@ -1603,6 +1603,7 @@ mod tests {
                 Value::build_text("alice"),
                 Value::from_i64(0),
                 Value::from_i64(0),
+                Value::from_i64(0),
             ]])
             .unwrap();
         let alice = with_alice.get_by_name("alice").unwrap().id;

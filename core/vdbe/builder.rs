@@ -7,6 +7,7 @@ use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
 
 use crate::{
     index_method::IndexMethodAttachment,
+    namespace::NamespaceRef,
     parameters::Parameters,
     schema::{BTreeTable, Column, ColumnLayout, Index, PseudoCursorType, Schema, Table, Trigger},
     security::permission::PermissionDenied,
@@ -290,9 +291,9 @@ pub struct ProgramBuilder {
     /// Every virtual table that the program inserts into, updates or deletes
     /// from.
     pub written_virtual_tables: Vec<Arc<VirtualTable>>,
-    /// Every view that the program reads. A view is replaced by its query,
-    /// so it opens no storage of its own.
-    pub referenced_views: Vec<String>,
+    /// Every view that the program reads, with its namespace. A view is
+    /// replaced by its query, so it opens no storage of its own.
+    pub referenced_views: Vec<(NamespaceRef, String)>,
     /// The original indexes of the instructions that open the CDC table to
     /// write change records. The records are the engine's own, so the
     /// privilege checks skip these instructions.

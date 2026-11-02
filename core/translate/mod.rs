@@ -159,6 +159,7 @@ pub fn translate(
     if !prepare_options.reads_engine_metadata {
         roles::check_statement_privileges(&stmt, &resolver, &connection)?;
     }
+    let write_privilege = roles::write_privilege(&stmt);
 
     match stmt {
         // There can be no nesting with pragma, so lift it up here
@@ -178,7 +179,7 @@ pub fn translate(
     program.epilogue(schema);
 
     if !prepare_options.reads_engine_metadata {
-        roles::check_storage_access(&program, &resolver, &connection)?;
+        roles::check_storage_access(&program, &resolver, &connection, write_privilege)?;
     }
 
     program.build(connection, change_cnt_on, input)

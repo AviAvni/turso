@@ -12,7 +12,9 @@ use crate::settings::{
 };
 use crate::statement::{PgTxState, PostRunFn, StatementResultKind, TxRole};
 use turso_core::schema::Table;
+use turso_core::security::acl_catalog::ObjectKey;
 use turso_core::security::permission::{Action, Object, PermissionDenied};
+use turso_core::security::privilege::{ObjectKind, Privilege, Privileges};
 use turso_core::{
     Connection, IOResult, LimboError, Qualifier, Result, Statement, StepResult, Value,
 };
@@ -1057,24 +1059,37 @@ impl DeferredOperation {
                         if conn.is_tx_read_only() {
                             return Err(LimboError::ReadOnly);
                         }
-                        require_superuser(conn, || {
-                            PermissionDenied::privilege(
-                                Action::Create,
-                                Object::Database(catalog::db_name_from_path(conn.db_file_path())),
-                            )
-                        })?;
+                        let may_create = conn.current_role_may(
+                            turso_core::MAIN_DB_ID,
+                            &ObjectKey::root(ObjectKind::Database, "main"),
+                            Privileges::of(Privilege::Create),
+                        );
+                        if !may_create {
+                            return Err(LimboError::PermissionDenied(Box::new(
+                                PermissionDenied::privilege(
+                                    Action::Create,
+                                    Object::Database(catalog::db_name_from_path(
+                                        conn.db_file_path(),
+                                    )),
+                                ),
+                            )));
+                        }
                         create_schema_commands(conn, stmt)?
                     }
                     FrontendStmt::DropSchema(stmt) => {
                         if conn.is_tx_read_only() {
                             return Err(LimboError::ReadOnly);
                         }
-                        require_superuser(conn, || {
-                            PermissionDenied::owner(
-                                Action::Drop,
-                                Object::Schema(stmt.name.to_lowercase()),
-                            )
-                        })?;
+                        let schema_name = stmt.name.to_lowercase();
+                        let owns = conn.current_role_owns(
+                            turso_core::MAIN_DB_ID,
+                            &ObjectKey::root(ObjectKind::Schema, schema_name.as_str()),
+                        );
+                        if !owns {
+                            return Err(LimboError::PermissionDenied(Box::new(
+                                PermissionDenied::owner(Action::Drop, Object::Schema(schema_name)),
+                            )));
+                        }
                         drop_schema_commands(conn, stmt)?
                     }
                     FrontendStmt::CopyFrom(stmt) => {

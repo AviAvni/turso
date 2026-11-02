@@ -109,12 +109,6 @@ impl Privileges {
         Privileges(privilege as u16)
     }
 
-    pub fn from_iter(privileges: impl IntoIterator<Item = Privilege>) -> Privileges {
-        privileges
-            .into_iter()
-            .fold(Privileges::NONE, Privileges::with)
-    }
-
     pub fn contains(self, privilege: Privilege) -> bool {
         self.0 & privilege as u16 != 0
     }
@@ -147,6 +141,14 @@ impl Privileges {
         Privilege::ALL
             .into_iter()
             .filter(move |privilege| self.contains(*privilege))
+    }
+}
+
+impl FromIterator<Privilege> for Privileges {
+    fn from_iter<I: IntoIterator<Item = Privilege>>(privileges: I) -> Self {
+        privileges
+            .into_iter()
+            .fold(Privileges::NONE, Privileges::with)
     }
 }
 
