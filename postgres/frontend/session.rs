@@ -1092,7 +1092,9 @@ impl DeferredOperation {
                             index: 0,
                         })));
                     }
-                    FrontendStmt::RefreshMatview | FrontendStmt::CommentOn => {
+                    FrontendStmt::RefreshMatview
+                    | FrontendStmt::CommentOn
+                    | FrontendStmt::GrantOrRevoke => {
                         if conn.is_tx_read_only() {
                             return Err(LimboError::ReadOnly);
                         }
@@ -1640,7 +1642,8 @@ fn try_prepare_special(
         | FrontendStmt::DropSchema(_)
         | FrontendStmt::CopyFrom(_)
         | FrontendStmt::RefreshMatview
-        | FrontendStmt::CommentOn) => crate::Statement::with_deferred(
+        | FrontendStmt::CommentOn
+        | FrontendStmt::GrantOrRevoke) => crate::Statement::with_deferred(
             noop_statement(&pg_conn.conn)?,
             DeferredExecution::new(pg_conn, DeferredOperation::Frontend(stmt)),
         ),
