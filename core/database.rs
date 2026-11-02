@@ -5,6 +5,7 @@
 
 use crate::connection_hooks::{ConnectionContext, ConnectionHooks};
 use crate::namespace::NamespaceId;
+use crate::security::acl_catalog::{ACL_TABLE_NAME, SELECT_ACL_SQL};
 use crate::security::roles::{RoleId, SessionRole, ROLES_TABLE_NAME, SELECT_ROLES_SQL};
 use crate::types::IOResultOr;
 use crate::util::IOExt;
@@ -353,6 +354,8 @@ pub enum OpenDbAsyncPhase {
     /// bootstrap, because before it an MVCC database has no table roots and
     /// has not replayed its logical log.
     LoadingRoles,
+    /// Reads the access control table into the ACL catalog.
+    LoadingAcls,
     Done,
 }
 
@@ -582,6 +585,10 @@ pub struct OpenDbAsyncState {
     /// across yields.
     roles_stmt: Option<Box<Statement>>,
     role_rows: Vec<Vec<Value>>,
+    /// The access control table scan of `LoadingAcls` and the rows read so
+    /// far, held across yields.
+    acl_stmt: Option<Box<Statement>>,
+    acl_rows: Vec<Vec<Value>>,
 }
 
 impl Default for OpenDbAsyncState {
@@ -608,6 +615,8 @@ impl OpenDbAsyncState {
             mvcc_convert_stmt: None,
             roles_stmt: None,
             role_rows: Vec::new(),
+            acl_stmt: None,
+            acl_rows: Vec::new(),
         }
     }
 }
@@ -1859,6 +1868,44 @@ impl Database {
                             Arc::new(db.schema.lock().roles.with_stored_roles(&state.role_rows)?);
                         db.with_schema_mut(|schema| {
                             schema.roles = roles;
+                            Ok(())
+                        })?;
+                    }
+
+                    state.phase = OpenDbAsyncPhase::LoadingAcls;
+                }
+
+                OpenDbAsyncPhase::LoadingAcls => {
+                    let db = state
+                        .db
+                        .as_ref()
+                        .expect("db must be initialized in Init phase");
+                    let conn = state
+                        .conn
+                        .as_ref()
+                        .expect("conn must be initialized in Init phase");
+                    if state.acl_stmt.is_none() {
+                        let schema = db.schema.lock().clone();
+                        let has_acl_table = db.dialect().supports_roles()
+                            && schema
+                                .get_btree_table(NamespaceId::ROOT, ACL_TABLE_NAME)
+                                .is_some();
+                        *conn.schema.write() = schema;
+                        if has_acl_table {
+                            state.acl_stmt = Some(Box::new(conn.prepare(SELECT_ACL_SQL)?));
+                        }
+                    }
+                    if let Some(stmt) = state.acl_stmt.as_mut() {
+                        let rows = &mut state.acl_rows;
+                        return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
+                            rows.push(row.get_values().cloned().collect());
+                            Ok(())
+                        }));
+                        state.acl_stmt = None;
+                        let acls =
+                            Arc::new(db.schema.lock().acls.with_stored_rows(&state.acl_rows)?);
+                        db.with_schema_mut(|schema| {
+                            schema.acls = acls;
                             Ok(())
                         })?;
                     }
