@@ -9,6 +9,7 @@ use crate::{
     index_method::IndexMethodAttachment,
     parameters::Parameters,
     schema::{BTreeTable, Column, ColumnLayout, Index, PseudoCursorType, Schema, Table, Trigger},
+    security::permission::PermissionDenied,
     translate::{
         collate::CollationSeq,
         emitter::{MaterializedColumnRef, TransactionMode},
@@ -296,6 +297,10 @@ pub struct ProgramBuilder {
     /// write change records. The records are the engine's own, so the
     /// privilege checks skip these instructions.
     pub change_capture_writes: Vec<usize>,
+    /// The first denial found in a trigger or foreign-key action subprogram
+    /// of this program. The privilege checks report it after the program's
+    /// own accesses pass.
+    pub subprogram_denial: Option<PermissionDenied>,
     /// A vector where index=label number, value=resolved offset. Resolved in build().
     /// For each allocated label, the offset of the instruction emitted *just
     /// before* the label's logical "next-insn" anchor. The label resolves to
@@ -839,6 +844,7 @@ impl ProgramBuilder {
             written_virtual_tables: Vec::new(),
             referenced_views: Vec::new(),
             change_capture_writes: Vec::new(),
+            subprogram_denial: None,
             constant_spans: Vec::new(),
             label_to_resolved_offset: Vec::with_capacity(opts.approx_num_labels),
             explain: ExplainInfo::default(),
@@ -1390,6 +1396,13 @@ impl ProgramBuilder {
             return;
         }
         self.insns.push((insn, self.insns.len()));
+    }
+
+    /// Keeps the first denial found in a subprogram of this program.
+    pub fn record_subprogram_denial(&mut self, denial: Option<PermissionDenied>) {
+        if self.subprogram_denial.is_none() {
+            self.subprogram_denial = denial;
+        }
     }
 
     /// Emits the instruction that opens the CDC table for writing change
