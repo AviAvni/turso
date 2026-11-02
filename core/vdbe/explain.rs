@@ -2132,6 +2132,26 @@ pub fn insn_to_row(
                 0,
                 format!("add role {name} id=r[{id_reg}] superuser={superuser} ignores_row_policies={ignores_row_policies}"),
             ),
+            Insn::SetAcl {
+                db,
+                id_reg,
+                key,
+                access,
+            } => (
+                "SetAcl",
+                *db as i64,
+                *id_reg as i64,
+                0,
+                Value::build_text(key.name.clone()),
+                0,
+                format!(
+                    "set acl of {} {} id=r[{id_reg}] owner={} acl={}",
+                    key.kind.stored_name(),
+                    key.name,
+                    access.owner.get(),
+                    access.acl.to_stored()
+                ),
+            ),
             Insn::DropView {
                 db,
                 namespace: _,

@@ -2159,6 +2159,7 @@ fn parse_table(
     if let Some(table) = table {
         let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
         let internal_id = program.table_reference_counter.next();
+        program.record_table_reference(internal_id);
         let tbl_ref = if let Table::Virtual(tbl) = table.as_ref() {
             transform_args_into_where_terms(args, internal_id, vtab_predicates, table.as_ref())?;
             Table::Virtual(tbl.clone())
@@ -2196,7 +2197,13 @@ fn parse_table(
     if let Some(view) = regular_view {
         program
             .referenced_views
-            .push((namespace, view.name.clone()));
+            .push(crate::vdbe::builder::ViewRead {
+                view: crate::vdbe::builder::ViewRef {
+                    namespace,
+                    name: view.name.clone(),
+                },
+                through: program.view_being_expanded(),
+            });
         // Views are essentially query aliases, so just Expand the view as a subquery.
         let has_alias = maybe_alias.is_some();
         let view_alias = maybe_alias
@@ -2211,7 +2218,7 @@ fn parse_table(
         // fixed to the database it was created in, not resolved TEMP-first
         // like an ordinary top-level query.
         let view_plan = resolver.with_view_scope(namespace, view.name.clone(), || {
-            program.with_view_expansion(database_id, &view.name, |program| {
+            program.with_view_expansion(namespace, &view.name, |program| {
                 prepare_select_plan(
                     view.select_stmt.clone(),
                     resolver,

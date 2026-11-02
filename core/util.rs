@@ -1769,6 +1769,7 @@ where
         | ast::Stmt::CreateSchema { .. }
         | ast::Stmt::CreateRole { .. }
         | ast::Stmt::SetRole { .. }
+        | ast::Stmt::Grant(_)
         | ast::Stmt::DropSchema { .. } => {}
     }
     Ok(())
