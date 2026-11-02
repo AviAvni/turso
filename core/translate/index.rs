@@ -218,6 +218,7 @@ pub fn translate_create_index(
             &columns,
             Some(&resolver.catalog),
             reject_qualified_columns_in_db,
+            !connection.is_nested_stmt(),
             schema,
             resolver.catalog.symbol_table,
         )
@@ -1023,7 +1024,7 @@ pub fn resolve_sorted_columns(
     schema: &Schema,
     syms: &SymbolTable,
 ) -> crate::Result<crate::alloc::Vec<IndexColumn>> {
-    resolve_sorted_columns_with_catalog(table, cols, None, None, schema, syms)
+    resolve_sorted_columns_with_catalog(table, cols, None, None, false, schema, syms)
 }
 
 pub fn reject_explicit_nulls(cols: &[SortedColumn]) -> crate::Result<()> {
@@ -1037,7 +1038,8 @@ pub fn reject_explicit_nulls(cols: &[SortedColumn]) -> crate::Result<()> {
 
 /// The index columns of `cols`. A column, or an expression, whose type has an
 /// order is kept in that order, so the index is in the order comparisons on
-/// it use; an explicit COLLATE on it is an error.
+/// it use. An explicit COLLATE on it is an error when
+/// `reject_collate_on_ordered_types` is set, and is ignored otherwise.
 ///
 /// When `reject_qualified_columns_in_db` names the index's database, a qualified
 /// column name in an indexed term is an error, as in SQLite. The WHERE clause of a
@@ -1047,9 +1049,21 @@ fn resolve_sorted_columns_with_catalog(
     cols: &[SortedColumn],
     resolver: Option<&CatalogContext>,
     reject_qualified_columns_in_db: Option<&str>,
+    reject_collate_on_ordered_types: bool,
     schema: &Schema,
     syms: &SymbolTable,
 ) -> crate::Result<crate::alloc::Vec<IndexColumn>> {
+    // An earlier version may have stored a COLLATE on a column whose type now
+    // has its own order, as for uuid. Collations only change how text
+    // compares, and such a column stores no text, so that index is already in
+    // the type's order.
+    let index_key_collation = |explicit_collation, ordering: Option<TypeOrdering>| {
+        let explicit_collation = match ordering {
+            Some(_) if !reject_collate_on_ordered_types => None,
+            _ => explicit_collation,
+        };
+        key_collation(explicit_collation, ordering)
+    };
     let mut resolved =
         <crate::alloc::Vec<_> as crate::alloc::TursoTryWithCapacityExt>::try_with_capacity_ext(
             cols.len(),
@@ -1067,7 +1081,7 @@ fn resolve_sorted_columns_with_catalog(
         let index_column = if let Some((pos, column_name, column)) =
             resolve_index_column(unwrapped_expr, table)
         {
-            let collation = key_collation(explicit_collation, column.type_ordering())?
+            let collation = index_key_collation(explicit_collation, column.type_ordering())?
                 .unwrap_or_else(|| column.collation());
             let expr = match column.generated_type() {
                 GeneratedType::Virtual { expr, .. } => Some(expr.clone()),
@@ -1088,7 +1102,7 @@ fn resolve_sorted_columns_with_catalog(
                 crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
             }
             let ordering = expression_type_ordering(unwrapped_expr, table, schema, syms)?;
-            let collation = key_collation(explicit_collation, ordering)?;
+            let collation = index_key_collation(explicit_collation, ordering)?;
             IndexColumn {
                 name: sc.expr.to_string(),
                 order,

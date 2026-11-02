@@ -326,6 +326,65 @@ mod tests {
         }
     }
 
+    /// Earlier versions accepted a COLLATE on an index of a uuid column. Such a
+    /// database must still open, and its index must be used in the uuid order,
+    /// which is the order it was built in. A new index like it is still refused.
+    #[test]
+    fn test_uuid_index_with_collate_from_earlier_version_still_works() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("uuid_index_collate.db");
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute("CREATE TABLE t(id uuid) STRICT").unwrap();
+            conn.execute("CREATE INDEX ti ON t(id)").unwrap();
+            conn.execute(
+                "INSERT INTO t VALUES ('b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'), \
+                 ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'), (NULL)",
+            )
+            .unwrap();
+
+            // Turso has no writable_schema pragma. Use the same schema-write
+            // bypass as VACUUM during prepare, then execute normally.
+            conn.start_nested();
+            let stmt = conn.prepare(
+                "UPDATE sqlite_schema SET sql = 'CREATE INDEX ti ON t(id COLLATE RTRIM)' \
+                 WHERE name = 'ti'",
+            );
+            conn.end_nested();
+            stmt.unwrap().run_ignore_rows().unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            conn.close().unwrap();
+        }
+
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+        conn.execute("INSERT INTO t VALUES ('{C0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11}')")
+            .unwrap();
+        let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+        assert_eq!(integrity, vec![("ok".to_string(),)]);
+        let rows: Vec<(i64,)> = conn.exec_rows(
+            "SELECT count(*) FROM t INDEXED BY ti WHERE id = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'",
+        );
+        assert_eq!(rows, vec![(1,)]);
+        let rows: Vec<(String,)> = conn.exec_rows(
+            "SELECT id FROM t INDEXED BY ti WHERE id > 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' ORDER BY id",
+        );
+        let ids = [
+            "b0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+            "c0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+        ];
+        assert_eq!(rows, ids.map(|id| (id.to_string(),)));
+
+        let error = conn
+            .execute("CREATE INDEX ti2 ON t(id COLLATE RTRIM)")
+            .unwrap_err()
+            .to_string();
+        assert_that!(error).contains("collations are not supported by type uuid");
+    }
+
     #[test]
     fn test_reopen_fails_when_stored_custom_type_does_not_parse() {
         let temp_dir = TempDir::new().unwrap();
