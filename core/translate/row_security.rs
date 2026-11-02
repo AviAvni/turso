@@ -1428,6 +1428,52 @@ mod tests {
         );
     }
 
+    /// A query's own conditions must never run on a hidden row, or an error
+    /// they raise, such as malformed JSON, would reveal the row. The policy
+    /// filter is evaluated before them in every query shape.
+    #[test]
+    fn query_conditions_never_see_hidden_rows() {
+        let conn = open_connection();
+        create_docs_with_owner_policy(&conn);
+        for sql in [
+            "ALTER TABLE docs ADD COLUMN body TEXT",
+            "UPDATE docs SET body = '{\"x\": 1}'",
+            "UPDATE docs SET body = 'not json' WHERE id = 2",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        let hidden_row_query = "SELECT id FROM docs WHERE json_extract(body, '$.x') = 1";
+        assert_error_contains(conn.execute(hidden_row_query), "malformed JSON");
+
+        set_role(&conn, "alice").unwrap();
+
+        let queries = [
+            hidden_row_query,
+            "SELECT id FROM docs WHERE id = 2 AND json_extract(body, '$.x') = 1",
+            "SELECT id FROM docs WHERE json_extract(body, '$.x') = 1 AND id > 0",
+            "SELECT docs.id FROM ids JOIN docs ON docs.id = ids.id WHERE json_extract(docs.body, '$.x') = 1",
+            "SELECT docs.id FROM docs JOIN ids ON docs.id = ids.id WHERE json_extract(docs.body, '$.x') = 1",
+            "SELECT ids.id FROM ids LEFT JOIN docs ON docs.id = ids.id AND json_extract(docs.body, '$.x') = 1",
+            "SELECT id FROM (SELECT * FROM docs) WHERE json_extract(body, '$.x') = 1",
+            "SELECT id FROM docs WHERE EXISTS (SELECT 1 WHERE json_extract(docs.body, '$.x') = 1)",
+            "SELECT json_extract(body, '$.x') FROM docs",
+            "SELECT id FROM docs ORDER BY json_extract(body, '$.x')",
+            "SELECT count(*) FROM docs GROUP BY json_extract(body, '$.x')",
+        ];
+        for sql in queries {
+            conn.execute(sql)
+                .unwrap_or_else(|error| panic!("{sql}: {error}"));
+        }
+        reset_role(&conn).unwrap();
+        conn.execute("CREATE INDEX docs_owner ON docs(owner)")
+            .unwrap();
+        set_role(&conn, "alice").unwrap();
+        for sql in queries {
+            conn.execute(sql)
+                .unwrap_or_else(|error| panic!("with index, {sql}: {error}"));
+        }
+    }
+
     #[cfg(feature = "fs")]
     fn open_file(io: &Arc<dyn IO>, path: &str, opts: DatabaseOpts) -> Arc<Database> {
         Database::open_file_with_flags(
