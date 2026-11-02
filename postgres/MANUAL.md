@@ -82,8 +82,8 @@ role again.
 Ownership and `GRANT` are not supported yet. A role that is not a superuser
 therefore has no privileges on tables, views, or sequences, and cannot create
 or drop objects. It can still run statements that use no database objects,
-such as `SELECT 1`, and switch roles. It also cannot use `SHOW`, or `SET`
-for any setting other than `search_path`.
+such as `SELECT 1`, read the `pg_catalog` tables, change settings with `SET`
+and show them with `SHOW`, and switch roles.
 
 `SET ROLE` is not supported inside a transaction block, and `SET LOCAL ROLE`
 is not supported.
